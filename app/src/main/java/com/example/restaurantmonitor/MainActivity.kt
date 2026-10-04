@@ -51,6 +51,9 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -67,6 +70,11 @@ const val GOOGLE_SHEET_AUTH_CSV_URL = "https://docs.google.com/spreadsheets/d/e/
 const val GOOGLE_SHEET_APK_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRd5flUUgB6kq2GD_HlOuGXHTJ6yMrGfvg05ZYjBC_mf9cmxeluMoYw4VQB_06AehbOKXB0DkQWgrLl/pub?gid=1381228885&single=true&output=csv"
 const val GOOGLE_SHEET_MSG_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRd5flUUgB6kq2GD_HlOuGXHTJ6yMrGfvg05ZYjBC_mf9cmxeluMoYw4VQB_06AehbOKXB0DkQWgrLl/pub?gid=997114230&single=true&output=csv"
 
+/** 網路設備檢查間隔 */
+const val NETWORK_CHECK_INTERVAL_MS = 10_000L
+/** 連續失敗幾次後才判定斷線並通知（過濾瞬斷） */
+const val OFFLINE_CONFIRM_FAILURES = 2
+
 // 資料模型
 data class Device(
     val id: String, 
@@ -74,7 +82,8 @@ data class Device(
     var ip: String, 
     val port: Int? = null,
     var isOnline: Boolean = true, 
-    var hasNotifiedOffline: Boolean = false, 
+    var hasNotifiedOffline: Boolean = false,
+    var offlineFailCount: Int = 0,
     val troubleshootingMsg: String,
     val hasCashDrawer: Boolean = false // 新增：是否連接錢箱
 )
@@ -246,33 +255,60 @@ fun MonitorScreen() {
     LaunchedEffect(isAuthorized) {
         while (true) {
             if (!isAuthorized) { delay(5000); continue }
+
+            // SSID 立刻更新，不卡在後面的 ping / 9100
             val currentSsid = getWifiSSID(context)
             val cleanSsid = currentSsid.uppercase()
             val printers = devices.filter { it.name.contains("出單機") || it.name.contains("🖨️") }
             val allPrintersOffline = printers.isNotEmpty() && printers.all { !it.isOnline }
-
-            for (i in devices.indices) {
-                val device = devices[i]
-                var isReachable = true
-                if (device.id == "0") {
-                    if (currentSsid.isEmpty() || cleanSsid.contains("UNKNOWN")) {
-                        devices[i].ip = "切換中..."; isReachable = true
-                    } else {
-                        devices[i].ip = currentSsid
-                        isReachable = if (allPrintersOffline) cleanSsid.startsWith("TAKOPOS") else true
-                    }
+            val wifiIdx = devices.indexOfFirst { it.id == "0" }
+            if (wifiIdx != -1) {
+                val wifi = devices[wifiIdx]
+                val wifiReachable: Boolean
+                val wifiDisplay: String
+                if (currentSsid.isEmpty() || cleanSsid.contains("UNKNOWN")) {
+                    wifiDisplay = "切換中..."
+                    wifiReachable = true
                 } else {
-                    isReachable = if (device.port != null) checkSocketPort(device.ip, device.port) else pingIp(device.ip)
+                    wifiDisplay = currentSsid
+                    wifiReachable = if (allPrintersOffline) cleanSsid.startsWith("TAKOPOS") else true
                 }
+                applyDeviceReachability(
+                    devices = devices,
+                    index = wifiIdx,
+                    device = wifi.copy(ip = wifiDisplay),
+                    isReachable = wifiReachable,
+                    context = context
+                )
+            }
 
-                if (!isReachable && !device.hasNotifiedOffline) {
-                    playAlertSound(); sendDisconnectNotification(context, device.name, device.troubleshootingMsg)
-                    devices[i] = device.copy(isOnline = false, hasNotifiedOffline = true)
-                } else if (isReachable && !device.isOnline) {
-                    devices[i] = device.copy(isOnline = true, hasNotifiedOffline = false)
+            // 其餘設備在 IO 平行檢查（出單機：ping 或 9100 擇一成功即通）
+            val reachability = withContext(Dispatchers.IO) {
+                coroutineScope {
+                    devices.mapIndexed { index, device ->
+                        async {
+                            if (device.id == "0") {
+                                index to true
+                            } else {
+                                val ok = if (device.port != null) {
+                                    isHostReachable(device.ip, device.port)
+                                } else {
+                                    pingIp(device.ip)
+                                }
+                                index to ok
+                            }
+                        }
+                    }.awaitAll()
                 }
             }
-            delay(5000)
+
+            for ((index, isReachable) in reachability) {
+                if (devices.getOrNull(index)?.id == "0") continue
+                val device = devices.getOrNull(index) ?: continue
+                applyDeviceReachability(devices, index, device, isReachable, context)
+            }
+
+            delay(NETWORK_CHECK_INTERVAL_MS)
         }
     }
 
@@ -697,24 +733,88 @@ fun ApkItem(apk: ApkInfo, context: Context) {
 
 fun getWifiSSID(context: Context): String {
     val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+    @Suppress("DEPRECATION")
     val info = wifiManager.connectionInfo
-    return info.ssid.replace("\"", "")
+    return info.ssid?.replace("\"", "") ?: ""
+}
+
+/** 出單機：ping 或指定 port（9100）擇一成功即視為在線 */
+suspend fun isHostReachable(ip: String, port: Int): Boolean = coroutineScope {
+    val pingJob = async { pingIp(ip) }
+    val portJob = async { checkSocketPort(ip, port) }
+    // 誰先成功就算通；兩邊都失敗才算斷
+    while (true) {
+        if (pingJob.isCompleted && pingJob.getCompleted()) {
+            portJob.cancel()
+            return@coroutineScope true
+        }
+        if (portJob.isCompleted && portJob.getCompleted()) {
+            pingJob.cancel()
+            return@coroutineScope true
+        }
+        if (pingJob.isCompleted && portJob.isCompleted) {
+            return@coroutineScope false
+        }
+        delay(30)
+    }
+    @Suppress("UNREACHABLE_CODE")
+    false
 }
 
 fun pingIp(ip: String): Boolean {
+    if (ip.isBlank() || ip.contains("切換") || ip.contains("偵測")) return false
     return try {
-        val process = Runtime.getRuntime().exec("/system/bin/ping -c 1 -w 2 $ip")
+        // -c 1 只送一包；-w 1 整次最多約 1 秒（原本 -w 2）
+        val process = Runtime.getRuntime().exec(arrayOf("/system/bin/ping", "-c", "1", "-w", "1", ip))
         process.waitFor() == 0
     } catch (e: Exception) { false }
 }
 
 fun checkSocketPort(ip: String, port: Int): Boolean {
+    if (ip.isBlank() || ip.contains("切換") || ip.contains("偵測")) return false
     return try {
         Socket().use { socket ->
-            socket.connect(InetSocketAddress(ip, port), 2000)
+            socket.connect(InetSocketAddress(ip, port), 1200)
             true
         }
     } catch (e: Exception) { false }
+}
+
+fun applyDeviceReachability(
+    devices: MutableList<Device>,
+    index: Int,
+    device: Device,
+    isReachable: Boolean,
+    context: Context
+) {
+    if (!isReachable) {
+        val failCount = device.offlineFailCount + 1
+        val confirmedOffline = failCount >= OFFLINE_CONFIRM_FAILURES
+        if (confirmedOffline && !device.hasNotifiedOffline) {
+            playAlertSound()
+            sendDisconnectNotification(context, device.name, device.troubleshootingMsg)
+            devices[index] = device.copy(
+                isOnline = false,
+                hasNotifiedOffline = true,
+                offlineFailCount = failCount
+            )
+        } else {
+            devices[index] = device.copy(
+                isOnline = if (confirmedOffline) false else device.isOnline,
+                offlineFailCount = failCount
+            )
+        }
+        return
+    }
+
+    // 在線：更新狀態／SSID 顯示
+    if (!device.isOnline || device.offlineFailCount > 0 || device.hasNotifiedOffline || device.ip != devices[index].ip) {
+        devices[index] = device.copy(
+            isOnline = true,
+            hasNotifiedOffline = false,
+            offlineFailCount = 0
+        )
+    }
 }
 
 fun playAlertSound() {
