@@ -46,7 +46,6 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
-import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationCompat
@@ -199,6 +198,39 @@ fun MonitorScreen() {
     var currentAnnouncement by remember { mutableStateOf<Pair<String, String>?>(null) }
     var msgHistory by remember { mutableStateOf<List<Pair<String, String>>>(emptyList()) }
 
+    // OTA 更新狀態
+    var pendingUpdate by remember { mutableStateOf<OtaUpdateInfo?>(null) }
+    var showUpdateDialog by remember { mutableStateOf(false) }
+    var isCheckingUpdate by remember { mutableStateOf(false) }
+    var isDownloadingUpdate by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableStateOf(0) }
+    var updateStatusMessage by remember { mutableStateOf<String?>(null) }
+    val activity = context as? ComponentActivity
+
+    suspend fun runUpdateCheck(manual: Boolean) {
+        if (isCheckingUpdate || isDownloadingUpdate) return
+        isCheckingUpdate = true
+        if (manual) updateStatusMessage = null
+        try {
+            val info = OtaUpdater.checkForUpdate(context, storeIdInput.ifBlank { null })
+            if (info != null) {
+                pendingUpdate = info
+                showUpdateDialog = true
+            } else if (manual) {
+                updateStatusMessage = "✅ 已是最新版本 ($currentToolVersion)"
+                Toast.makeText(context, "已是最新版本", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            if (manual) {
+                updateStatusMessage = "❌ 檢查更新失敗"
+                Toast.makeText(context, "檢查更新失敗", Toast.LENGTH_SHORT).show()
+            }
+            e.printStackTrace()
+        } finally {
+            isCheckingUpdate = false
+        }
+    }
+
     // 啟動/關閉 懸浮錢箱按鈕服務
     LaunchedEffect(devices.map { it.hasCashDrawer }) {
         val anyCashDrawerEnabled = devices.any { it.hasCashDrawer }
@@ -271,6 +303,16 @@ fun MonitorScreen() {
         }
     }
 
+    // 🔄 OTA：授權後立即檢查，之後每 30 分鐘
+    LaunchedEffect(isAuthorized) {
+        if (!isAuthorized) return@LaunchedEffect
+        delay(3000)
+        while (true) {
+            runUpdateCheck(manual = false)
+            delay(30 * 60 * 1000L)
+        }
+    }
+
     if (currentAnnouncement != null) {
         AlertDialog(
             onDismissRequest = { },
@@ -318,6 +360,14 @@ fun MonitorScreen() {
                             isMsgLoading = false
                         }
                     })
+                    DropdownMenuItem(
+                        text = { Text(if (isCheckingUpdate) "🔄 檢查更新中..." else "🔄 檢查 App 更新") },
+                        onClick = {
+                            showMenu = false
+                            coroutineScope.launch { runUpdateCheck(manual = true) }
+                        },
+                        enabled = !isCheckingUpdate && !isDownloadingUpdate
+                    )
                     DropdownMenuItem(text = { Text("💡 技術支援 (Line)") }, onClick = { showMenu = false; showSupportDialog = true })
                 }
             }
@@ -506,6 +556,69 @@ fun MonitorScreen() {
                 }
             },
             confirmButton = { Button(onClick = { showImageDialog = false }) { Text("關閉") } }
+        )
+    }
+
+    if (showUpdateDialog && pendingUpdate != null) {
+        val update = pendingUpdate!!
+        AlertDialog(
+            onDismissRequest = { if (!isDownloadingUpdate) showUpdateDialog = false },
+            title = { Text("🔄 發現新版本") },
+            text = {
+                Column {
+                    Text("目前版本：$currentToolVersion")
+                    Text("最新版本：${update.latestVersion}", fontWeight = FontWeight.Bold)
+                    if (update.releaseNotes.isNotBlank()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(update.releaseNotes, fontSize = 13.sp, color = Color.DarkGray)
+                    }
+                    if (isDownloadingUpdate) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        LinearProgressIndicator(
+                            progress = { downloadProgress / 100f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text("下載中... $downloadProgress%", fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp))
+                    }
+                    updateStatusMessage?.let {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(it, color = if (it.startsWith("❌")) Color.Red else Color.Gray, fontSize = 13.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        coroutineScope.launch {
+                            if (activity != null && !OtaUpdater.canInstallPackages(context)) {
+                                updateStatusMessage = "請先允許「安裝未知應用程式」後再按更新"
+                                OtaUpdater.requestInstallPermission(activity)
+                                return@launch
+                            }
+                            isDownloadingUpdate = true
+                            downloadProgress = 0
+                            updateStatusMessage = null
+                            try {
+                                val apk = OtaUpdater.downloadApk(context, update.downloadUrl) { downloadProgress = it }
+                                OtaUpdater.installApk(context, apk)
+                                showUpdateDialog = false
+                            } catch (e: Exception) {
+                                updateStatusMessage = "❌ 下載或安裝失敗，請稍後再試"
+                                e.printStackTrace()
+                            } finally {
+                                isDownloadingUpdate = false
+                            }
+                        }
+                    },
+                    enabled = !isDownloadingUpdate
+                ) { Text(if (isDownloadingUpdate) "下載中..." else "立即更新") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showUpdateDialog = false },
+                    enabled = !isDownloadingUpdate
+                ) { Text("稍後") }
+            }
         )
     }
 }
