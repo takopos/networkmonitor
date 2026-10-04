@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:padding="8dp">
+
+    <ImageButton
+        android:id="@+id/btn_open_drawer"
+        android:layout_width="77dp"
+        android:layout_height="77dp"
+        android:background="@android:drawable/btn_default"
+        android:src="@drawable/cash"
+        android:scaleType="centerInside"
+        android:contentDescription="Open Cash Drawer"
+        android:elevation="8dp" />
+</FrameLayout>
